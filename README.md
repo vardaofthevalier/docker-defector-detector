@@ -66,6 +66,7 @@ The `info` field was generated using the following overall stragegy:
 					* does this hostname match the "container id" regex? 
 						* if no: then we conclude that the IP address resolves to a stale container, which is an error condition.
 
+The solution to the detected problems involves correcting the IPVS configuration for the service on the Swarm node reported in the `source_node` field.
 
 It's recommended that you log this service's container's logs to syslog for downstream consumption by a monitoring/alerting pipeline in order to effectively and quickly respond to the errors detected.
 
