@@ -88,7 +88,8 @@ In general, the service depends on the following environment variables:
 
 Example: deploy using the host's docker socket:
 
-```docker service create \
+```
+docker service create \
 	--name docker-defector-detector \
 	--mode global \
 	--log-driver syslog \
@@ -102,7 +103,8 @@ Example: deploy using the host's docker socket:
 
 Example: deploy using a (secure) TCP connection:
 
-```docker service create \
+```
+docker service create \
 	--name docker-defector-detector \
 	--mode global \
 	--log-driver syslog \
