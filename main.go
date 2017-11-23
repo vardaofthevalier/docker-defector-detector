@@ -24,6 +24,8 @@ import (
 	- ENVIRONMENT 		:	The lifecycle environment where all of the services are running
 	- CONTAINER_NAME	:	The name of this container
 	- SERVICE_NAME 		:	The name of the service running this container
+	- DOCKER_HOST		:	tcp://<docker-host-ip>:<docker-host-port>
+	- DOCKER_TSL_VERIFY	:	Should be set to false
 */
 
 type SourceNode struct {
@@ -69,7 +71,8 @@ func main() {
 		environment = os.Getenv("ENVIRONMENT")
 		nodeId string
 		nodeIp string
-		client *docker.Client
+		managerClient *docker.Client
+		workerClient *docker.Client
 		err error
 		ctx = context.Background()
 		output ApplicationErrorResponse
@@ -78,11 +81,22 @@ func main() {
 	var debug = flag.Bool("debug", false, "If true, will output info messages in addition to error messages")
 	flag.Parse()
 	
-	client, err = docker.NewEnvClient()
+	// create clients for connecting to the swarm manager daemon and also for the underlying host's daemon
+	managerClient, err = docker.NewEnvClient()
 	if err != nil {
 		output.Status = "ERROR"
 		output.Source = "environment"
-		output.Info = fmt.Sprintf("There was a problem connecting to the Docker API server: %v", err)
+		output.Info = fmt.Sprintf("There was a problem connecting to the Docker API server on the manager node: %v", err)
+		LogResponse(output, logger, true)
+	}
+
+	os.Setenv("DOCKER_HOST", "")
+	os.Setenv("DOCKER_TSL_VERIFY", "")
+	workerClient, err = docker.NewEnvClient()
+	if err != nil {
+		output.Status = "ERROR"
+		output.Source = "environment"
+		output.Info = fmt.Sprintf("There was a problem connecting to the Docker API server on the underlying node: %v", err)
 		LogResponse(output, logger, true)
 	}
 
@@ -102,7 +116,7 @@ func main() {
 	}
 
 	var containers []types.Container
-	containers, err = client.ContainerList(ctx, containerFilters)
+	containers, err = workerClient.ContainerList(ctx, containerFilters)
 	if err != nil {
 		output.Status = "ERROR"
 		output.Source = "environment"
@@ -120,7 +134,7 @@ func main() {
 		Filters: filters.NewArgs(taskFilter),
 	}
 
-	tasks, err = client.TaskList(ctx, taskFilters)
+	tasks, err = managerClient.TaskList(ctx, taskFilters)
 	if err != nil {
 		output.Status = "ERROR"
 		output.Source = "environment"
@@ -135,7 +149,7 @@ func main() {
 	}
 
 	if nodeId != "" {
-		node, _, err := client.NodeInspectWithRaw(ctx, nodeId)
+		node, _, err := managerClient.NodeInspectWithRaw(ctx, nodeId)
 		if err != nil {
 			output.Status = "ERROR"
 			output.Source = "environment"
@@ -154,7 +168,7 @@ func main() {
 	for {
 		// get a list of all services
 		var serviceList []swarm.Service
-		serviceList, err = client.ServiceList(ctx, types.ServiceListOptions{})
+		serviceList, err = managerClient.ServiceList(ctx, types.ServiceListOptions{})
 		if err != nil {
 			output.Status = "ERROR"
 			output.Source = "environment"
@@ -172,7 +186,7 @@ func main() {
 
 		// for each service, run a goroutine to log any found service networking errors
 		for _, svc := range serviceList {
-			go CheckService(ctx, client, svc, environment, nodeId, nodeIp, logger, *debug)
+			go CheckService(ctx, managerClient, svc, environment, nodeId, nodeIp, logger, *debug)
 		}
 
 		// sleep for interval
