@@ -13,6 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"encoding/json"
+	"github.com/mediocregopher/radix.v2/pool"
+	"github.com/mediocregopher/radix.v2/redis"
+	"github.com/mediocregopher/radix.v2/pubsub"
+	uuid "github.com/satori/go.uuid"
 	docker "github.com/docker/docker/client"
 	types "github.com/docker/docker/api/types"
 	swarm "github.com/docker/docker/api/types/swarm"
@@ -25,6 +29,8 @@ import (
 	- CONTAINER_NAME	:	The name of this container
 	- SERVICE_NAME 		:	The name of the service running this container
 	- ROLE				:	"worker" or "manager"
+	- REDIS_HOST		:	The redis host for worker services to connect to
+	- REDIS_PORT		:	The redis port for worker services to connect to
 */
 
 type SourceNode struct {
@@ -45,6 +51,7 @@ type ServiceCheckInfo struct {
 	ServiceIpMap map[string][]string 	`json:"service_ip_to_hosts_map,omitempty"`
 	ServiceHostMap map[string][]string 	`json:"service_host_to_ip_map,omitempty"`
 	Node SourceNode						`json:"source_node"`
+	Role string 						`json:"source_node_role"`
 	Environment string 					`json:"environment"`
 	Messages []string 					`json:"messages"`
 }
@@ -61,6 +68,12 @@ type ApplicationErrorResponse struct {
 	Info string 	`json:"info"`
 }
 
+type PubsubRequest struct {
+	Id string
+	NodeId string
+	ServiceName string
+}
+
 func main() {
 	var (
 		logger = log.New(os.Stderr, "", log.LUTC)
@@ -68,13 +81,23 @@ func main() {
 		containerName = os.Getenv("CONTAINER_NAME")
 		serviceName = os.Getenv("SERVICE_NAME")
 		environment = os.Getenv("ENVIRONMENT")
+		role = os.Getenv("ROLE")
 		nodeId string
 		nodeIp string
 		client *docker.Client
+		redisPool *pool.Pool
 		err error
 		ctx = context.Background()
 		output ApplicationErrorResponse
 	)
+
+	redisPool, err = pool.New("tcp", fmt.Sprintf("%s:%s", os.Getenv("REDIS_HOST"), os.Getenv("REDIS_PORT")), 10)
+	if err != nil {
+		output.Status = "ERROR"
+		output.Source = "environment"
+		output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
+		LogResponse(output, logger, true)
+	}
 
 	var debug = flag.Bool("debug", false, "If true, will output info messages in addition to error messages")
 	flag.Parse()
@@ -87,99 +110,263 @@ func main() {
 		LogResponse(output, logger, true)
 	}
 
-	// what node am I running on?
-	containerNameFilter := filters.KeyValuePair{
-		Key: "name",
-		Value: containerName,
-	}
+	if role == "manager" {
+		tlConn, err := redisPool.Get()
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
+			LogResponse(output, logger, true)
+		}
+		defer redisPool.Put(tlConn)
 
-	containerTaskFilter := filters.KeyValuePair{
-		Key: "is-task",
-		Value: "true",
-	}
+		tlPubsub := pubsub.NewSubClient(tlConn)
+		go ServeRequestsForTaskList(ctx, client, tlConn, tlPubsub, &output, logger)
 
-	containerFilters := types.ContainerListOptions{
-		Filters: filters.NewArgs(containerNameFilter, containerTaskFilter),
-	}
+		nConn, err := redisPool.Get()
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
+			LogResponse(output, logger, true)
+		}
+		defer redisPool.Put(nConn)
 
-	var containers []types.Container
-	containers, err = client.ContainerList(ctx, containerFilters)
-	if err != nil {
-		output.Status = "ERROR"
-		output.Source = "environment"
-		output.Info = fmt.Sprintf("There was a problem getting the current container's info: %v", err)
-		LogResponse(output, logger, true)
-	}
+		nPubsub := pubsub.NewSubClient(nConn)
+		go ServeRequestsForNode(ctx, client, nConn, nPubsub, &output, logger)
 
-	var tasks []swarm.Task
-	taskFilter := filters.KeyValuePair{
-		Key: "service",
-		Value: serviceName,
-	}
+		slConn, err := redisPool.Get()
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
+			LogResponse(output, logger, true)
+		}
+		defer redisPool.Put(nConn)
 
-	taskFilters := types.TaskListOptions{
-		Filters: filters.NewArgs(taskFilter),
-	}
+		slPubsub := pubsub.NewSubClient(slConn)
+		go ServeRequestsForServiceList(ctx, client, slConn, slPubsub, &output, logger)
 
-	tasks, err = client.TaskList(ctx, taskFilters)
-	if err != nil {
-		output.Status = "ERROR"
-		output.Source = "environment"
-		output.Info = fmt.Sprintf("There was a problem getting the current container's task info: %v", err)
-		LogResponse(output, logger, true)
-	}
+		// gather facts 
+		containers, err := GetContainerList(ctx, client, containerName)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting the current container's info: %v", err)
+			LogResponse(output, logger, true)
+		}
 
-	for _, t := range tasks {
-		for _, c := range containers {
-			if t.Status.ContainerStatus.ContainerID == c.ID {
-				nodeId = t.NodeID
+		tasks, err := GetTaskList(ctx, client, serviceName) 
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting the current container's task info: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		for _, t := range tasks {
+			for _, c := range containers {
+				if t.Status.ContainerStatus.ContainerID == c.ID {
+					nodeId = t.NodeID
+				}
 			}
 		}
-	}
 
-	if nodeId != "" {
-		node, _, err := client.NodeInspectWithRaw(ctx, nodeId)
-		if err != nil {
+		if nodeId != "" {
+			node, err := GetNode(ctx, client, nodeId)
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "environment"
+				output.Info = fmt.Sprintf("There was a problem getting the current container's node info: %v", err)
+				LogResponse(output, logger, true)
+			} else {
+				nodeIp = node.Status.Addr
+			}
+		} else {
 			output.Status = "ERROR"
 			output.Source = "environment"
 			output.Info = fmt.Sprintf("There was a problem getting the current container's node info: %v", err)
 			LogResponse(output, logger, true)
-		} else {
-			nodeIp = node.Status.Addr
 		}
-	} else {
-		output.Status = "ERROR"
-		output.Source = "environment"
-		output.Info = fmt.Sprintf("There was a problem getting the current container's node info: %v", err)
-		LogResponse(output, logger, true)
-	}
 
-	for {
-		// get a list of all services
-		var serviceList []swarm.Service
-		serviceList, err = client.ServiceList(ctx, types.ServiceListOptions{})
+		for {
+			// get a list of all services
+			var serviceList []swarm.Service
+			serviceList, err = GetServiceList(ctx, client)
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "environment"
+				output.Info = fmt.Sprintf("There was a problem getting a listing of services: %v", err)
+				LogResponse(output, logger, true)
+			}
+
+			sleepInterval, err := strconv.Atoi(sleepInterval)
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "application"
+				output.Info = fmt.Sprintf("There was a problem converting the interval string to an integer: %v", err)
+				LogResponse(output, logger, true)
+			}
+
+			// for each service, run a goroutine to log any found service networking errors
+			for _, svc := range serviceList {
+				go CheckService(ctx, client, svc, environment, nodeId, role, nodeIp, logger, *debug)
+			}
+
+			// sleep for interval
+			time.Sleep(time.Duration(int64(sleepInterval)) * time.Second)
+		}
+	} else if role == "worker" {
+		myId := uuid.NewV4().String()
+		tlConn, err := redisPool.Get()
 		if err != nil {
 			output.Status = "ERROR"
 			output.Source = "environment"
-			output.Info = fmt.Sprintf("There was a problem getting a listing of services: %v", err)
+			output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
 			LogResponse(output, logger, true)
 		}
+		defer redisPool.Put(tlConn)
 
-		sleepInterval, err := strconv.Atoi(sleepInterval)
+		tlPubsub := pubsub.NewSubClient(tlConn)
+
+		nConn, err := redisPool.Get()
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
+			LogResponse(output, logger, true)
+		}
+		defer redisPool.Put(nConn)
+
+		nPubsub := pubsub.NewSubClient(nConn)
+
+		slConn, err := redisPool.Get()
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem connecting to the Redis server: %v", err)
+			LogResponse(output, logger, true)
+		}
+		defer redisPool.Put(nConn)
+
+		slPubsub := pubsub.NewSubClient(slConn)
+		// gather facts 
+
+		// send request for task list
+		req := &PubsubRequest{
+			Id: myId,
+			ServiceName: serviceName,
+		}
+
+		err = MakeRequest(tlConn, req, "task-list-requests")
 		if err != nil {
 			output.Status = "ERROR"
 			output.Source = "application"
-			output.Info = fmt.Sprintf("There was a problem converting the interval string to an integer: %v", err)
+			output.Info = fmt.Sprintf("There was a problem making a request to channel 'task-list-requests': %v", err)
 			LogResponse(output, logger, true)
 		}
 
-		// for each service, run a goroutine to log any found service networking errors
-		for _, svc := range serviceList {
-			go CheckService(ctx, client, svc, environment, nodeId, nodeIp, logger, *debug)
+		// wait for task list response
+		tasks, err := ReceiveTaskList(tlPubsub, fmt.Sprintf("task-list-%s", myId))
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem unmarshaling json for task list: %v", err)
+			LogResponse(output, logger, true)
 		}
 
-		// sleep for interval
-		time.Sleep(time.Duration(int64(sleepInterval)) * time.Second)
+		containers, err := GetContainerList(ctx, client, containerName)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting the current container's info: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		for _, t := range tasks {
+			for _, c := range containers {
+				if t.Status.ContainerStatus.ContainerID == c.ID {
+					nodeId = t.NodeID
+				}
+			}
+		}
+
+		if nodeId != "" {
+			// make a request for node info
+			req := &PubsubRequest{
+				Id: myId,
+				NodeId: nodeId,
+			}
+			err = MakeRequest(nConn, req, "node-requests")
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "application"
+				output.Info = fmt.Sprintf("There was a problem making a request to channel 'node-requests': %v", err)
+				LogResponse(output, logger, true)
+			}
+
+			// wait for node info
+			node, err := ReceiveNode(nPubsub, fmt.Sprintf("node-%s", myId))
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "application"
+				output.Info = fmt.Sprintf("There was a problem unmarshaling json for node info: %v", err)
+				LogResponse(output, logger, true)
+			}
+			nodeIp = node.Status.Addr
+		} else {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting the current container's node info: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		for {
+			// get a list of all services
+			req := &PubsubRequest{
+				Id: myId,
+			}
+			// make a request for the service list
+			err = MakeRequest(slConn, req, "service-list-requests")
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "application"
+				output.Info = fmt.Sprintf("There was a problem making a request to channel 'service-list-requests': %v", err)
+				LogResponse(output, logger, true)
+			}
+
+			// wait to receive the service list
+			serviceList, err := ReceiveServiceList(slPubsub, fmt.Sprintf("service-list-%s", myId))
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "application"
+				output.Info = fmt.Sprintf("There was a problem unmarshaling json for service list: %v", err)
+				LogResponse(output, logger, true)
+			}
+
+			sleepInterval, err := strconv.Atoi(sleepInterval)
+			if err != nil {
+				output.Status = "ERROR"
+				output.Source = "application"
+				output.Info = fmt.Sprintf("There was a problem converting the interval string to an integer: %v", err)
+				LogResponse(output, logger, true)
+			}
+
+			// for each service, run a goroutine to log any found service networking errors
+			for _, svc := range serviceList {
+				go CheckService(ctx, client, svc, environment, nodeId, role, nodeIp, logger, *debug)
+			}
+
+			// sleep for interval
+			time.Sleep(time.Duration(int64(sleepInterval)) * time.Second)
+		}
+
+
+	} else {
+		output.Status = "ERROR"
+		output.Source = "environment"
+		output.Info = fmt.Sprintf("Required environment variable 'ROLE' not set, or was set to an incorrect value! (must be 'manager' or 'worker')")
+		LogResponse(output, logger, true)
 	}
 }
 
@@ -207,7 +394,247 @@ func LogResponse(o interface{}, logger *log.Logger, fatal bool) {
 	}
 }
 
-func CheckService(ctx context.Context, client *docker.Client, svc swarm.Service, environment string, nodeId string, nodeIp string, logger *log.Logger, debug bool) {
+func MakeRequest(redisConn *redis.Client, r *PubsubRequest, channelName string) error {
+	req, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+
+	err = redisConn.Cmd("PUBLISH", fmt.Sprintf(channelName), req).Err 
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ServeRequestsForTaskList(ctx context.Context, docker *docker.Client, redisConn *redis.Client, ps *pubsub.SubClient, output *ApplicationErrorResponse, logger *log.Logger) {
+	ps.Subscribe("task-list-requests")
+	for {
+		var m *pubsub.SubResp
+		m = ps.Receive()
+
+		// unmarshal from json to PubsubRequest
+		result := &PubsubRequest{}
+
+		err := json.Unmarshal([]byte(m.Message), result)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem unmarshaling json for task list request: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// get the task list
+		tl, err := GetTaskList(ctx, docker, result.ServiceName)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting a listing of tasks: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// marshal the task list to json
+		resp, err := json.Marshal(tl)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem marshaling json for task list response: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// publish the task list to the worker's task list bus
+		redisConn.Cmd("PUBLISH", fmt.Sprintf("task-list-%s", result.Id), resp)
+	}
+
+}
+
+func ReceiveTaskList(ps *pubsub.SubClient, channelId string) ([]swarm.Task, error) {
+	ps.Subscribe(fmt.Sprintf("task-list-%s", channelId))
+
+	var m *pubsub.SubResp
+	m = ps.Receive()
+
+	result := []swarm.Task{}
+	err := json.Unmarshal([]byte(m.Message), result)
+	if err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+func ServeRequestsForNode(ctx context.Context, docker *docker.Client, redisConn *redis.Client, ps *pubsub.SubClient, output *ApplicationErrorResponse, logger *log.Logger) {
+	ps.Subscribe("node-requests")
+	for {
+		var m *pubsub.SubResp
+		m = ps.Receive()
+
+		// unmarshal from json to PubsubRequest
+		result := &PubsubRequest{}
+		err := json.Unmarshal([]byte(m.Message), result)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem unmarshaling json for node info request: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// get the task list
+		n, err := GetNode(ctx, docker, result.NodeId)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting node info: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// marshal the task list to json
+		resp, err := json.Marshal(n)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem marshaling json for node info: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// publish the task list to the worker's task list bus
+		redisConn.Cmd("PUBLISH", fmt.Sprintf("node-%s", result.Id), resp)
+	}
+}
+
+func ReceiveNode(ps *pubsub.SubClient, channelId string) (swarm.Node, error) {
+	ps.Subscribe(fmt.Sprintf("node-%s", channelId))
+
+	var m *pubsub.SubResp
+	m = ps.Receive()
+	result := swarm.Node{}
+	err := json.Unmarshal([]byte(m.Message), result)
+	if err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+func ServeRequestsForServiceList(ctx context.Context, docker *docker.Client, redisConn *redis.Client, ps *pubsub.SubClient, output *ApplicationErrorResponse, logger *log.Logger) {
+	ps.Subscribe("service-list-requests")
+	for {
+		var m *pubsub.SubResp
+		m = ps.Receive()
+
+		// unmarshal from json to PubsubRequest
+		result := &PubsubRequest{}
+		err := json.Unmarshal([]byte(m.Message), result)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem unmarshaling json for service list request: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// get the task list
+		sl, err := GetServiceList(ctx, docker)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "environment"
+			output.Info = fmt.Sprintf("There was a problem getting a listing of services: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// marshal the task list to json
+		resp, err := json.Marshal(sl)
+		if err != nil {
+			output.Status = "ERROR"
+			output.Source = "application"
+			output.Info = fmt.Sprintf("There was a problem marshaling json for service list response: %v", err)
+			LogResponse(output, logger, true)
+		}
+
+		// publish the task list to the worker's task list bus
+		redisConn.Cmd("PUBLISH", fmt.Sprintf("service-list-%s", result.Id), resp)
+	}
+}
+
+func ReceiveServiceList(ps *pubsub.SubClient, channelId string) ([]swarm.Service, error) {
+	ps.Subscribe(fmt.Sprintf("service-list-%s", channelId))
+
+	var m *pubsub.SubResp
+	m = ps.Receive()
+	result := []swarm.Service{}
+	err := json.Unmarshal([]byte(m.Message), result)
+	if err != nil {
+		return result, err
+	}
+
+	return result, nil
+}
+
+func GetContainerList(ctx context.Context, client *docker.Client, containerName string) ([]types.Container, error) {
+	// what node am I running on?
+	var err error
+	containerNameFilter := filters.KeyValuePair{
+		Key: "name",
+		Value: containerName,
+	}
+
+	containerTaskFilter := filters.KeyValuePair{
+		Key: "is-task",
+		Value: "true",
+	}
+
+	containerFilters := types.ContainerListOptions{
+		Filters: filters.NewArgs(containerNameFilter, containerTaskFilter),
+	}
+
+	var containers []types.Container
+	containers, err = client.ContainerList(ctx, containerFilters)
+	if err != nil {
+		return containers, err
+	}
+
+	return containers, nil
+}
+func GetTaskList(ctx context.Context, client *docker.Client, serviceName string) ([]swarm.Task, error) {
+	var err error
+	var tasks []swarm.Task
+	taskFilter := filters.KeyValuePair{
+		Key: "service",
+		Value: serviceName,
+	}
+
+	taskFilters := types.TaskListOptions{
+		Filters: filters.NewArgs(taskFilter),
+	}
+
+	tasks, err = client.TaskList(ctx, taskFilters)
+	if err != nil {
+		return tasks, err
+	}
+
+	return tasks, nil
+}
+
+func GetNode(ctx context.Context, client *docker.Client, nodeId string) (swarm.Node, error) {
+	node, _, err := client.NodeInspectWithRaw(ctx, nodeId)
+	if err != nil {
+		return node, err
+	}
+
+	return node, nil
+}
+
+func GetServiceList(ctx context.Context, client *docker.Client) ([]swarm.Service, error) {
+	serviceList, err := client.ServiceList(ctx, types.ServiceListOptions{})
+	if err != nil {
+		return serviceList, err
+	}
+
+	return serviceList, nil
+}
+
+func CheckService(ctx context.Context, client *docker.Client, svc swarm.Service, environment string, nodeId string, role string, nodeIp string, logger *log.Logger, debug bool) {
 	var err error
 	var tasks []swarm.Task
 	var output ServiceCheckResponse
@@ -223,6 +650,7 @@ func CheckService(ctx context.Context, client *docker.Client, svc swarm.Service,
 	info.ServiceName = svc.Spec.Name 
 	info.ServiceId = svc.ID
 	info.Node = node
+	info.Role = role
 	info.ServiceIpMap = map[string][]string{}
 	info.ServiceHostMap = map[string][]string{}
 	info.Messages = []string{}
